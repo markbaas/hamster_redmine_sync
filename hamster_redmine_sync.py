@@ -101,6 +101,7 @@ class HamsterRedmine:
     # Config
     db_path = os.path.join(os.path.expanduser('~'), '.local', 'share', 'hamster-applet',
                            'hamster.db')
+    # db_path = os.path.join(os.getcwd(), 'hamster.db')
     redm = None
     session = None
     period = None
@@ -161,11 +162,38 @@ class HamsterRedmine:
             if not time_entries:
                 continue
 
-            print('\n{}'.format(activity.name))
+            print('{}'.format(activity.name))
 
             for date, spent_time in time_entries:
                 if spent_time:
                     self._push_time_entry(spent_time, issue_id, date)
+
+            print('\n')
+
+    def sync_redmine_issues(self):
+        issues = self.redm.issue.filter(assigned_to_id='me')
+        hissues = [{'category': issue.project.name,
+                    'name': "#{0} - {1}".format(issue.id, issue.subject),
+                    'search_name': "{} {}".format(issue.subject, issue.id)
+                    } for issue in issues]
+
+        for issue in hissues:
+            category = self.session.query(Category)\
+                .filter(Category.name == issue['category']).first()
+            if not category:
+                obj = Category(name=issue['category'])
+                self.session.add(obj)
+                print('Added category {}'.format(issue['category']))
+
+            activity = self.session.query(Activity)\
+                .filter(Activity.name == issue['name']).first()
+            if not activity:
+                obj = Activity(name=issue['name'], search_name=issue['search_name'],
+                               category=category)
+                self.session.add(obj)
+                print('Added activity {}'.format(issue['name']))
+
+        self.session.commit()
 
 
 class Config(dict):
@@ -181,6 +209,10 @@ class Config(dict):
         parser.add_argument('--redmine_apikey', help="redmine apikey")
         parser.add_argument('--redmine_url', help="redmine url")
         parser.add_argument('--period', choices=PERIODS.keys(), help='sync period')
+        parser.add_argument('--time_entries', type=int, choices=(1, 0),
+                            help='push time entries TO redmine', default=1)
+        parser.add_argument('--redmine_issues', type=int, choices=(1, 0),
+                            help='pull issue FROM redmine', default=1)
 
         args = vars(parser.parse_args())
 
@@ -192,4 +224,15 @@ class Config(dict):
 if __name__ == '__main__':
     config = Config()
     sync = HamsterRedmine(**config)
-    sync.sync_timeentries(period=config.get('period', 'week'))
+    if config.get('time_entries'):
+        print('''
+Pushing time entries to redmine.
+--------------------------------
+''')
+        sync.sync_timeentries(period=config.get('period', 'week'))
+    if config.get('redmine_issues'):
+        print('''
+Pulling issues from redmine.
+----------------------------
+''')
+        sync.sync_redmine_issues()
