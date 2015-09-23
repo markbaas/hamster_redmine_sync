@@ -10,12 +10,12 @@ from dateutil.relativedelta import relativedelta
 
 import datetime
 import logging
-import re
 import sys
 
 from redmine import Redmine
+from redmine.exceptions import ResourceAttrError
 
-from sqlalchemy import Column, Integer, String, ForeignKey, create_engine, DateTime
+from sqlalchemy import Column, Integer, String, ForeignKey, create_engine
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
@@ -31,47 +31,64 @@ PERIODS = {'month': (today.replace(day=1),
            }
 
 
-class Category(Base):
-    __tablename__ = 'categories'
+class Event(Base):
+    __tablename__ = 'Events'
 
     id = Column(Integer, primary_key=True)
-    name = Column(String)
-    color_code = Column(String)
-    category_order = Column(Integer)
-    search_name = Column(String)
+    user_id = Column(Integer)
+    event_id = Column(Integer)
+    installation_id = Column(Integer)
+    report_id = Column(Integer)
+    task = Column(Integer, ForeignKey('Tasks.task_id'))
+    comment = Column(String)
+    start = Column(String)
+    end = Column(String)
 
-    activities = relationship('Activity', backref='category')
+    @hybrid_property
+    def start_date(self):
+        return datetime.datetime.strptime(self.start, '%Y-%m-%dT%H:%M:%S')
+
+    @hybrid_property
+    def end_date(self):
+        return datetime.datetime.strptime(self.end, '%Y-%m-%dT%H:%M:%S')
+
+    @hybrid_property
+    def spent_time(self):
+        if self.end_date is None:
+            return (datetime.datetime.now() - self.start_date).seconds / 3600.
+        else:
+            return (self.end_date - self.start_date).seconds / 3600.
 
 
-class Activity(Base):
-    __tablename__ = 'activities'
+class Task(Base):
+    __tablename__ = 'Tasks'
 
     id = Column(Integer, primary_key=True)
+    task_id = Column(Integer)
+    parent = Column(Integer)
+    validfrom = Column(Integer)
+    validuntil = Column(Integer)
+    trackable = Column(Integer)
     name = Column(String)
-    work = Column(Integer)
-    activity_order = Column(Integer)
-    deleted = Column(Integer)
-    category_id = Column(Integer, ForeignKey('categories.id'))
-    search_name = Column(String)
 
-    facts = relationship('Fact', backref='activity')
-    facts_week = relationship(
-        'Fact',
-        primaryjoin='and_(Activity.id==Fact.activity_id, '
-                    'Fact.start_time >= "{}", Fact.start_time <= "{}")'.format(*PERIODS['week']),
-        order_by='Fact.start_time'
+    events = relationship('Event', backref='taska')
+    events_week = relationship(
+        'Event',
+        primaryjoin='and_(Task.task_id==Event.task, '
+                    'Event.start >= "{}", Event.start <= "{}")'.format(*PERIODS['week']),
+        order_by='Event.start'
     )
-    facts_month = relationship(
-        'Fact',
-        primaryjoin='and_(Activity.id==Fact.activity_id, '
-                    'Fact.start_time >= "{}", Fact.start_time <= "{}")'.format(*PERIODS['month']),
-        order_by='Fact.start_time'
+    events_month = relationship(
+        'Event',
+        primaryjoin='and_(Task.task_id==Event.task, '
+                    'Event.start >= "{}", Event.start <= "{}")'.format(*PERIODS['month']),
+        order_by='Event.start'
     )
 
     def get_spent_time_per_day(self, period='week'):
         d = defaultdict(float)
-        for fact in getattr(self, 'facts_' + period):
-            d[fact.start_time.date()] += fact.spent_time
+        for event in getattr(self, 'events_' + period):
+            d[event.start_date.date()] += event.spent_time
 
         for key, raw_time in d.items():
             d[key] = round(raw_time * 2) / 2  # rounded on half hours
@@ -79,27 +96,10 @@ class Activity(Base):
         return d
 
 
-class Fact(Base):
-    __tablename__ = 'facts'
-
-    id = Column(Integer, primary_key=True)
-    activity_id = Column(Integer, ForeignKey('activities.id'))
-    start_time = Column(DateTime)
-    end_time = Column(DateTime)
-    description = Column(String)
-
-    @hybrid_property
-    def spent_time(self):
-        if self.end_time is None:
-            return (datetime.datetime.now() - self.start_time).seconds / 3600.
-        else:
-            return (self.end_time - self.start_time).seconds / 3600.
-
-
-class HamsterRedmine:
+class CharmRedmine:
     # Config
-    db_path = os.path.join(os.path.expanduser('~'), '.local', 'share', 'hamster-applet',
-                           'hamster.db')
+    db_path = os.path.join(os.path.expanduser('~'), '.local', 'share', 'data',
+                           'KDAB', 'Charm', 'Charm.db')
     # db_path = os.path.join(os.getcwd(), 'hamster.db')
     redm = None
     session = None
@@ -127,8 +127,8 @@ class HamsterRedmine:
         engine = create_engine('sqlite:///' + self.db_path)
         self.session = sessionmaker(bind=engine)()
 
-    def _get_activities(self):
-        return self.session.query(Activity)
+    def _get_tasks(self):
+        return self.session.query(Task)
 
     def _push_time_entry(self, spent_time, issue_id, date):
         entries = self.redm.time_entry.filter(spent_on=date, issue_id=issue_id,
@@ -148,47 +148,43 @@ class HamsterRedmine:
             print('  {}: {} hours (new)'.format(date, spent_time))
 
     def sync_timeentries(self, period='week'):
-        for activity in self._get_activities():
-            try:
-                issue_id = re.findall(r'#(\d+)', activity.name)[0]
-            except IndexError:
-                continue
-
-            time_entries = activity.get_spent_time_per_day(period=period).items()
+        for task in self._get_tasks():
+            time_entries = task.get_spent_time_per_day(period=period).items()
 
             if not time_entries:
                 continue
 
-            print('{}'.format(activity.name))
+            print('#{} {}'.format(task.task_id, task.name))
 
             for date, spent_time in time_entries:
                 if spent_time:
-                    self._push_time_entry(spent_time, issue_id, date)
+                    self._push_time_entry(spent_time, task.task_id, date)
 
             print('\n')
 
     def sync_redmine_issues(self):
         issues = self.redm.issue.filter(assigned_to_id='me')
-        hissues = [{'category': issue.project.name,
-                    'name': "#{0} - {1}".format(issue.id, issue.subject),
-                    'search_name': "{} {}".format(issue.subject, issue.id)
-                    } for issue in issues]
 
-        for issue in hissues:
-            category = self.session.query(Category)\
-                .filter(Category.name == issue['category']).first()
-            if not category:
-                obj = Category(name=issue['category'])
-                self.session.add(obj)
-                print('Added category {}'.format(issue['category']))
+        for issue in issues:
+            task = self.session.query(Task)\
+                .filter(Task.task_id == issue.id).first()
+            if not task:
+                try:
+                    parent_id = issue.parent.id
+                except ResourceAttrError:
+                    parent_id = 0
 
-            activity = self.session.query(Activity)\
-                .filter(Activity.name == issue['name']).first()
-            if not activity:
-                obj = Activity(name=issue['name'], search_name=issue['search_name'],
-                               category=category)
+                obj = Task(name=issue.subject, task_id=issue.id, trackable=1, parent=parent_id)
                 self.session.add(obj)
-                print('Added activity {}'.format(issue['name']))
+                print('Added task {}'.format(issue.subject))
+
+        # Check consistency
+        for task in self.session.query(Task).all():
+            if task.parent:
+                parent = self.session.query(Task).filter(Task.task_id == task.parent).first()
+                if not parent:
+                    task.parent = 0
+                self.session.add(task)
 
         self.session.commit()
 
@@ -196,7 +192,7 @@ class HamsterRedmine:
 class Config(dict):
     def __init__(self):
         config = configparser.ConfigParser()
-        config.read(os.path.join(os.path.expanduser('~'), '.config', 'hamster_redmine_sync.cfg'))
+        config.read(os.path.join(os.path.expanduser('~'), '.config', 'charm_redmine_sync.cfg'))
         config_values = config.items('general')
         for key, value in config_values:
             self[key] = value
@@ -220,7 +216,7 @@ class Config(dict):
 
 if __name__ == '__main__':
     config = Config()
-    sync = HamsterRedmine(**config)
+    sync = CharmRedmine(**config)
     if config.get('time_entries'):
         print('''
 Pushing time entries to redmine.
